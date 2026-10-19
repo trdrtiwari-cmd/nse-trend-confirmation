@@ -1,122 +1,95 @@
-                },
-            )
-            chain_response.raise_for_status()
-            chain_payload = chain_response.json()
 
-        chain = chain_payload.get("data", [])
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
+import os
 
-        if not isinstance(chain, list) or not chain:
-            return {
-                "ok": False,
-                "symbol": symbol,
-                "expiry": selected_expiry,
-                "available_expiries": expiries,
-                "message": "Option chain is empty.",
-            }
+import httpx
+from fastapi import FastAPI, Query
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
-        valid_rows = []
 
-        for row in chain:
-            if not isinstance(row, dict):
-                continue
+BASE = Path(__file__).resolve().parent.parent
+INDIA_TZ = ZoneInfo("Asia/Kolkata")
 
-            try:
-                strike = float(row["strike_price"])
-                spot = float(row["underlying_spot_price"])
-            except (KeyError, TypeError, ValueError):
-                continue
+MAX_CANDLE_AGE_SECONDS = 15 * 60
 
-            if strike > 0 and spot > 0:
-                valid_rows.append((strike, spot, row))
+app = FastAPI(
+    title="NSE Trend Confirmation",
+    version="0.5.0",
+)
 
-        if not valid_rows:
-            return {
-                "ok": False,
-                "symbol": symbol,
-                "message": "No valid strike or spot price found.",
-            }
+app.mount(
+    "/static",
+    StaticFiles(directory=BASE / "static"),
+    name="static",
+)
 
-        # Use the most frequent underlying spot if the API has repeated rows.
-        spot = valid_rows[0][1]
-        strikes = sorted({item[0] for item in valid_rows})
-        atm_strike = min(strikes, key=lambda strike: abs(strike - spot))
+REQUIRED = [
+    "advance_decline",
+    "sector_heatmap",
+    "option_premium_change",
+    "call_put_graph",
+    "index_direction",
+]
 
-        ce_candidates = []
-        pe_candidates = []
+INSTRUMENTS = {
+    "NIFTY": "NSE_INDEX|Nifty 50",
+    "BANKNIFTY": "NSE_INDEX|Nifty Bank",
+}
 
-        for strike, _, row in valid_rows:
-            if moneyness == "ATM":
-                if strike == atm_strike:
-                    ce_candidates.append((0, strike, row))
-                    pe_candidates.append((0, strike, row))
 
-            elif moneyness == "ITM":
-                # Call ITM: strike below or equal to spot.
-                if strike <= spot:
-                    ce_candidates.append((spot - strike, strike, row))
+def empty_data() -> dict[str, Any]:
+    return {key: None for key in REQUIRED}
 
-                # Put ITM: strike above or equal to spot.
-                if strike >= spot:
-                    pe_candidates.append((strike - spot, strike, row))
 
-            else:  # OTM
-                # Call OTM: strike above or equal to spot.
-                if strike >= spot:
-                    ce_candidates.append((strike - spot, strike, row))
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
-                # Put OTM: strike below or equal to spot.
-                if strike <= spot:
-                    pe_candidates.append((spot - strike, strike, row))
 
-        def choose(candidates):
-            if not candidates:
-                return None
-            return min(candidates, key=lambda item: item[0])[2]
+def parse_timestamp(value: Any) -> datetime:
+    timestamp = datetime.fromisoformat(
+        str(value).replace("Z", "+00:00")
+    )
 
-        ce = option_details(choose(ce_candidates), "CE")
-        pe = option_details(choose(pe_candidates), "PE")
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
 
-        return {
-            "ok": bool(ce or pe),
-            "symbol": symbol,
-            "expiry": selected_expiry,
-            "available_expiries": expiries,
-            "moneyness": moneyness,
-            "spot": spot,
-            "atm_strike": atm_strike,
-            "ce": ce,
-            "pe": pe,
-            "fetched_at": utc_now().isoformat(),
-            "quote_timestamp_available": False,
-            "quote_freshness_verified": False,
-            "source": "Upstox Option Chain API",
-            "message": (
-                "Option-chain response received. fetched_at is server "
-                "fetch time, not an exchange quote timestamp. Quote "
-                "freshness is not verified; do not treat this as a trade signal."
-            ),
-        }
+    return timestamp.astimezone(timezone.utc)
 
-    except httpx.HTTPStatusError as exc:
-        return {
-            "ok": False,
-            "symbol": symbol,
-            "message": (
-                f"Upstox returned HTTP {exc.response.status_code}. "
-                "Check API access, token validity, permissions, and Render logs."
-            ),
-        }
 
-    except httpx.HTTPError:
-        return {
-            "ok": False,
-            "symbol": symbol,
-            "message": "Could not connect to the Upstox option API.",
-        }
+def market_session_finished(now: datetime | None = None) -> bool:
+    """
+    Conservative expiry default:
+    after 15:30 IST, do not default to today's expiry.
+    This is not a holiday-calendar or exchange-session validator.
+    """
+    current = now or datetime.now(INDIA_TZ)
+    return (
+        current.hour > 15
+        or (current.hour == 15 and current.minute >= 30)
+    )
 
-    except (ValueError, TypeError, KeyError):
-        return {
-            "ok": False,
-            "symbol": symbol,
-            "message": "Unexpected or invalid option-chain response.",
-        }
+
+def regular_market_hours(now: datetime | None = None) -> bool:
+    """
+    Approximate NSE regular session: weekdays, 09:15–15:30 IST.
+    This does NOT check exchange holidays or special sessions.
+    """
+    current = (now or datetime.now(INDIA_TZ)).astimezone(INDIA_TZ)
+    minute_of_day = current.hour * 60 + current.minute
+    return current.weekday() < 5 and 9 * 60 + 15 <= minute_of_day < 15 * 60 + 30
+
+
+def available_expiries(
+    contracts: list[Any],
+    now: datetime | None = None,
+) -> list[str]:
+    current = now or datetime.now(INDIA_TZ)
+    today = current.date().isoformat()
+    after_market = market_session_finished(current)
+
+    values = set()
