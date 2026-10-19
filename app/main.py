@@ -3,18 +3,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 import os
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+
 
 BASE = Path(__file__).resolve().parent.parent
 
 app = FastAPI(
     title="NSE Trend Confirmation",
-    version="0.3.0",
+    version="0.4.0",
 )
 
 app.mount(
@@ -37,6 +39,7 @@ INSTRUMENTS = {
 }
 
 MAX_CANDLE_AGE_SECONDS = 15 * 60
+INDIA_TZ = ZoneInfo("Asia/Kolkata")
 
 
 def empty_data() -> dict[str, Any]:
@@ -107,9 +110,6 @@ class DataProvider:
             if not isinstance(candles, list) or len(candles) < 2:
                 raise ValueError("Fewer than two candles returned")
 
-            # Upstox candle format:
-            # [timestamp, open, high, low, close, volume, open_interest]
-            # Sort explicitly because API ordering should not be assumed.
             parsed = []
 
             for candle in candles:
@@ -132,10 +132,7 @@ class DataProvider:
             latest_time, latest, close_now = parsed[-1]
             previous_time, previous, close_previous = parsed[-2]
 
-            now = utc_now()
-            age_seconds = (now - latest_time).total_seconds()
-
-            # Reject future-dated and stale candles.
+            age_seconds = (utc_now() - latest_time).total_seconds()
             fresh = 0 <= age_seconds <= MAX_CANDLE_AGE_SECONDS
 
             bias = (
@@ -144,8 +141,6 @@ class DataProvider:
                 else 0
             )
 
-            # Show price and timestamp even if the candle is stale.
-            # Direction is trusted only if the candle is fresh.
             direction = {
                 "bias": bias if fresh else None,
                 "price": close_now,
@@ -163,42 +158,36 @@ class DataProvider:
                 "as_of": latest_time.isoformat(),
                 "data": data,
                 "fresh": fresh,
-                "market_data_status": (
-                    "RECEIVED" if fresh else "STALE"
-                ),
+                "market_data_status": "RECEIVED" if fresh else "STALE",
             })
 
             if fresh:
                 base["message"] = (
-                    "Fresh index candle received from Upstox. "
-                    "Other four required checks are not connected; "
-                    "signal remains WAIT."
+                    "Fresh index candle received. The other four "
+                    "required checks are not connected; signal remains WAIT."
                 )
             else:
                 base["message"] = (
-                    "Latest returned candle is stale or future-dated. "
-                    "Its price is shown for diagnosis only. "
-                    "Index direction is not trusted; signal remains WAIT."
+                    "Latest candle is stale or future-dated. Price is shown "
+                    "for diagnosis only; signal remains WAIT."
                 )
 
             return base
 
         except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-
             base["market_data_status"] = "API_ERROR"
             base["source"] = "Upstox API (HTTP error)"
             base["message"] = (
-                f"Upstox returned HTTP {status}. Check token validity, "
-                "instrument key, API permissions, and Render logs."
+                f"Upstox returned HTTP {exc.response.status_code}. "
+                "Check token validity, instrument key, permissions, "
+                "and Render logs."
             )
 
         except httpx.HTTPError:
             base["market_data_status"] = "CONNECTION_ERROR"
             base["source"] = "Upstox API (connection error)"
             base["message"] = (
-                "Upstox request failed or timed out. Check Render logs "
-                "and outbound connectivity."
+                "Upstox request failed or timed out. Check Render logs."
             )
 
         except (ValueError, TypeError, KeyError, IndexError):
@@ -225,6 +214,7 @@ def health():
     return {
         "ok": True,
         "app": app.title,
+        "version": app.version,
         "time": utc_now().isoformat(),
         "upstox_token_configured": bool(provider.token),
     }
@@ -272,11 +262,9 @@ async def snapshot(symbol: str):
         and bool(snap.get("as_of"))
     )
 
-    # Safe integration stage:
-    # Do not generate BUY signals until all five checks are implemented,
-    # timestamp-validated, and evaluated by a tested decision engine.
+    # Safe mode: do not enable BUY until all required checks
+    # and the decision engine have been implemented and tested.
     signal = "WAIT"
-
     reasons = []
 
     if missing:
@@ -309,3 +297,231 @@ async def snapshot(symbol: str):
         "message": snap.get("message"),
         "reasons": reasons,
     }
+
+
+def option_details(
+    row: dict[str, Any] | None,
+    side: str,
+) -> dict[str, Any] | None:
+    if not row:
+        return None
+
+    option_key = "call_options" if side == "CE" else "put_options"
+    option = row.get(option_key) or {}
+    market = option.get("market_data") or {}
+    greeks = option.get("option_greeks") or {}
+
+    return {
+        "type": side,
+        "strike": row.get("strike_price"),
+        "instrument_key": option.get("instrument_key"),
+        "ltp": market.get("ltp"),
+        "close_price": market.get("close_price"),
+        "volume": market.get("volume"),
+        "oi": market.get("oi"),
+        "prev_oi": market.get("prev_oi"),
+        "iv": greeks.get("iv", market.get("iv")),
+        "delta": greeks.get("delta"),
+        "theta": greeks.get("theta"),
+        "gamma": greeks.get("gamma"),
+        "vega": greeks.get("vega"),
+    }
+
+
+@app.get("/api/options/{symbol}")
+async def options_snapshot(
+    symbol: str,
+    expiry_date: str | None = None,
+    moneyness: str = Query(
+        default="ATM",
+        pattern="^(ATM|ITM|OTM)$",
+    ),
+):
+    symbol = symbol.upper()
+
+    if symbol not in INSTRUMENTS:
+        return {
+            "ok": False,
+            "message": "Choose NIFTY or BANKNIFTY.",
+        }
+
+    if not provider.token:
+        return {
+            "ok": False,
+            "message": "Upstox token is not configured in Render.",
+        }
+
+    instrument = INSTRUMENTS[symbol]
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {provider.token}",
+    }
+
+    today = datetime.now(INDIA_TZ).date().isoformat()
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            contracts_response = await client.get(
+                "https://api.upstox.com/v2/option/contract",
+                headers=headers,
+                params={"instrument_key": instrument},
+            )
+            contracts_response.raise_for_status()
+            contracts_payload = contracts_response.json()
+
+            contracts = contracts_payload.get("data", [])
+
+            if not isinstance(contracts, list):
+                raise ValueError("Invalid contracts response")
+
+            expiries = sorted({
+                str(item["expiry"])
+                for item in contracts
+                if isinstance(item, dict)
+                and item.get("expiry")
+                and str(item["expiry"]) >= today
+            })
+
+            if expiry_date:
+                if expiry_date not in expiries:
+                    return {
+                        "ok": False,
+                        "symbol": symbol,
+                        "message": (
+                            "Expiry not available. Use an expiry "
+                            "listed in available_expiries."
+                        ),
+                        "available_expiries": expiries,
+                    }
+                selected_expiry = expiry_date
+            else:
+                if not expiries:
+                    return {
+                        "ok": False,
+                        "symbol": symbol,
+                        "message": (
+                            "No current or future expiry returned by Upstox."
+                        ),
+                    }
+                selected_expiry = expiries[0]
+
+            chain_response = await client.get(
+                "https://api.upstox.com/v2/option/chain",
+                headers=headers,
+                params={
+                    "instrument_key": instrument,
+                    "expiry_date": selected_expiry,
+                },
+            )
+            chain_response.raise_for_status()
+            chain_payload = chain_response.json()
+
+        chain = chain_payload.get("data", [])
+
+        if not isinstance(chain, list) or not chain:
+            return {
+                "ok": False,
+                "symbol": symbol,
+                "expiry": selected_expiry,
+                "message": "Option chain is empty.",
+            }
+
+        valid_rows = []
+
+        for row in chain:
+            if not isinstance(row, dict):
+                continue
+
+            try:
+                strike = float(row["strike_price"])
+                spot = float(row["underlying_spot_price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            if strike > 0 and spot > 0:
+                valid_rows.append((strike, spot, row))
+
+        if not valid_rows:
+            return {
+                "ok": False,
+                "symbol": symbol,
+                "message": "No valid strike or spot price found.",
+            }
+
+        spot = valid_rows[0][1]
+        strikes = sorted({item[0] for item in valid_rows})
+        atm_strike = min(strikes, key=lambda k: abs(k - spot))
+
+        ce_candidates = []
+        pe_candidates = []
+
+        for strike, _, row in valid_rows:
+            if moneyness == "ATM":
+                if strike == atm_strike:
+                    ce_candidates.append((0, strike, row))
+                    pe_candidates.append((0, strike, row))
+
+            elif moneyness == "ITM":
+                if strike <= spot:
+                    ce_candidates.append((spot - strike, strike, row))
+                if strike >= spot:
+                    pe_candidates.append((strike - spot, strike, row))
+
+            else:  # OTM
+                if strike >= spot:
+                    ce_candidates.append((strike - spot, strike, row))
+                if strike <= spot:
+                    pe_candidates.append((spot - strike, strike, row))
+
+        def choose(candidates):
+            if not candidates:
+                return None
+            return min(candidates, key=lambda item: item[0])[2]
+
+        ce = option_details(choose(ce_candidates), "CE")
+        pe = option_details(choose(pe_candidates), "PE")
+
+        return {
+            "ok": bool(ce or pe),
+            "symbol": symbol,
+            "expiry": selected_expiry,
+            "available_expiries": expiries,
+            "moneyness": moneyness,
+            "spot": spot,
+            "atm_strike": atm_strike,
+            "ce": ce,
+            "pe": pe,
+            "fetched_at": utc_now().isoformat(),
+            "quote_timestamp_available": False,
+            "source": "Upstox Option Chain API",
+            "message": (
+                "Option-chain response received. fetched_at is the "
+                "server fetch time, not an exchange quote timestamp. "
+                "Verify quote freshness before trading."
+            ),
+        }
+
+    except httpx.HTTPStatusError as exc:
+        return {
+            "ok": False,
+            "symbol": symbol,
+            "message": (
+                f"Upstox returned HTTP {exc.response.status_code}. "
+                "Check API access, token validity, permissions, "
+                "and Render logs."
+            ),
+        }
+
+    except httpx.HTTPError:
+        return {
+            "ok": False,
+            "symbol": symbol,
+            "message": "Could not connect to the Upstox option API.",
+        }
+
+    except (ValueError, TypeError, KeyError):
+        return {
+            "ok": False,
+            "symbol": symbol,
+            "message": "Unexpected or invalid option-chain response.",
+        }
