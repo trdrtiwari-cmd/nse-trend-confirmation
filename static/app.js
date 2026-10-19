@@ -211,7 +211,7 @@ function renderOptionRows(data) {
     ['Previous Close', money(ce.close_price), money(pe.close_price)],
     ['Volume', number(ce.volume, 0), number(pe.volume, 0)],
     ['Open Interest (OI)', number(ce.oi, 0), number(pe.oi, 0)],
-    ['OI Change', percentChange(ce.oi, ce.prev_oi), percentChange(pe.oi, pe.prev_oi)],
+    ['OI Change (current OI − previous OI)', percentChange(ce.oi, ce.prev_oi), percentChange(pe.oi, pe.prev_oi)],
     ['Previous OI', number(ce.prev_oi, 0), number(pe.prev_oi, 0)],
     ['IV', number(ce.iv, 2), number(pe.iv, 2)],
     ['Delta', number(ce.delta, 4), number(pe.delta, 4)],
