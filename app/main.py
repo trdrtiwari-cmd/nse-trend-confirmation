@@ -11,8 +11,17 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 BASE = Path(__file__).resolve().parent.parent
-app = FastAPI(title="NSE Trend Confirmation", version="0.2.0")
-app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
+
+app = FastAPI(
+    title="NSE Trend Confirmation",
+    version="0.3.0",
+)
+
+app.mount(
+    "/static",
+    StaticFiles(directory=BASE / "static"),
+    name="static",
+)
 
 REQUIRED = [
     "advance_decline",
@@ -30,32 +39,58 @@ INSTRUMENTS = {
 MAX_CANDLE_AGE_SECONDS = 15 * 60
 
 
+def empty_data() -> dict[str, Any]:
+    return {key: None for key in REQUIRED}
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_timestamp(value: Any) -> datetime:
+    timestamp = datetime.fromisoformat(
+        str(value).replace("Z", "+00:00")
+    )
+
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+    return timestamp.astimezone(timezone.utc)
+
+
 class DataProvider:
     def __init__(self):
+        # Keep the token in Render Environment Variables only.
         self.token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
 
     async def snapshot(self, symbol: str) -> dict[str, Any]:
-        empty_data = {key: None for key in REQUIRED}
+        base = {
+            "symbol": symbol,
+            "as_of": None,
+            "checked_at": utc_now().isoformat(),
+            "source": "Upstox V3 Intraday Candles (5-minute)",
+            "data": empty_data(),
+            "fresh": False,
+            "market_data_status": "UNAVAILABLE",
+            "message": "",
+        }
 
         if not self.token:
-            return {
-                "symbol": symbol,
-                "as_of": None,
-                "source": "Upstox (not configured)",
-                "data": empty_data,
-                "message": (
-                    "Render Environment Variables mein "
-                    "UPSTOX_ACCESS_TOKEN set nahi hai."
-                ),
-                "fresh": False,
-            }
+            base["source"] = "Upstox (not configured)"
+            base["message"] = (
+                "UPSTOX_ACCESS_TOKEN Render Environment Variables "
+                "mein configure nahi hai."
+            )
+            return base
 
         instrument = INSTRUMENTS[symbol]
         encoded_key = quote(instrument, safe="")
+
         url = (
             "https://api.upstox.com/v3/historical-candle/"
             f"intraday/{encoded_key}/minutes/5"
         )
+
         headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {self.token}",
@@ -68,34 +103,40 @@ class DataProvider:
                 payload = response.json()
 
             candles = payload.get("data", {}).get("candles", [])
+
             if not isinstance(candles, list) or len(candles) < 2:
-                raise ValueError("API returned fewer than two candles.")
+                raise ValueError("Fewer than two candles returned")
 
             # Upstox candle format:
             # [timestamp, open, high, low, close, volume, open_interest]
-            latest = candles[0]
-            previous = candles[1]
+            # Sort explicitly because API ordering should not be assumed.
+            parsed = []
 
-            if len(latest) < 5 or len(previous) < 5:
-                raise ValueError("Unexpected candle format.")
+            for candle in candles:
+                if not isinstance(candle, (list, tuple)) or len(candle) < 5:
+                    continue
 
-            candle_time = datetime.fromisoformat(
-                str(latest[0]).replace("Z", "+00:00")
-            )
-            if candle_time.tzinfo is None:
-                candle_time = candle_time.replace(tzinfo=timezone.utc)
+                candle_dt = parse_timestamp(candle[0])
+                close = float(candle[4])
 
-            now = datetime.now(timezone.utc)
-            age_seconds = (now - candle_time.astimezone(timezone.utc)).total_seconds()
+                if close <= 0:
+                    continue
 
-            # Reject future-dated or stale candles.
+                parsed.append((candle_dt, candle, close))
+
+            if len(parsed) < 2:
+                raise ValueError("Not enough valid candles")
+
+            parsed.sort(key=lambda item: item[0])
+
+            latest_time, latest, close_now = parsed[-1]
+            previous_time, previous, close_previous = parsed[-2]
+
+            now = utc_now()
+            age_seconds = (now - latest_time).total_seconds()
+
+            # Reject future-dated and stale candles.
             fresh = 0 <= age_seconds <= MAX_CANDLE_AGE_SECONDS
-
-            close_now = float(latest[4])
-            close_previous = float(previous[4])
-
-            if not all(map(lambda x: x > 0, [close_now, close_previous])):
-                raise ValueError("Invalid candle close price.")
 
             bias = (
                 1 if close_now > close_previous
@@ -103,67 +144,72 @@ class DataProvider:
                 else 0
             )
 
-            # Keep stale candles visible for diagnosis, but don't use
-            # stale price direction to generate a trading signal.
+            # Show price and timestamp even if the candle is stale.
+            # Direction is trusted only if the candle is fresh.
             direction = {
                 "bias": bias if fresh else None,
                 "price": close_now,
                 "previous_close": close_previous,
-                "candle_time": candle_time.isoformat(),
-                "age_seconds": int(max(0, age_seconds)),
-            }
-
-            data = dict(empty_data)
-            if fresh:
-                data["index_direction"] = direction
-
-            if fresh:
-                message = (
-                    "Index candles received from Upstox. "
-                    "Other required checks are not connected yet; signal remains WAIT."
-                )
-            else:
-                message = (
-                    "Upstox returned an old or future-dated candle. "
-                    "Index direction is not trusted; signal remains WAIT."
-                )
-
-            return {
-                "symbol": symbol,
-                "as_of": candle_time.isoformat(),
-                "source": "Upstox V3 Intraday Candles (5-minute)",
-                "data": data,
-                "message": message,
+                "candle_time": latest_time.isoformat(),
+                "previous_candle_time": previous_time.isoformat(),
+                "age_seconds": int(age_seconds),
                 "fresh": fresh,
             }
 
+            data = empty_data()
+            data["index_direction"] = direction
+
+            base.update({
+                "as_of": latest_time.isoformat(),
+                "data": data,
+                "fresh": fresh,
+                "market_data_status": (
+                    "RECEIVED" if fresh else "STALE"
+                ),
+            })
+
+            if fresh:
+                base["message"] = (
+                    "Fresh index candle received from Upstox. "
+                    "Other four required checks are not connected; "
+                    "signal remains WAIT."
+                )
+            else:
+                base["message"] = (
+                    "Latest returned candle is stale or future-dated. "
+                    "Its price is shown for diagnosis only. "
+                    "Index direction is not trusted; signal remains WAIT."
+                )
+
+            return base
+
         except httpx.HTTPStatusError as exc:
-            # Do not return authorization headers or token in the response.
             status = exc.response.status_code
-            message = (
-                f"Upstox API returned HTTP {status}. "
-                "Token permissions, instrument key, or API availability "
-                "may need checking."
-            )
-        except httpx.HTTPError:
-            message = (
-                "Upstox API connection failed or timed out. "
-                "Check Render logs and service connectivity."
-            )
-        except (ValueError, TypeError, KeyError, IndexError):
-            message = (
-                "Upstox response was missing or had an unexpected format. "
-                "No trading signal generated."
+
+            base["market_data_status"] = "API_ERROR"
+            base["source"] = "Upstox API (HTTP error)"
+            base["message"] = (
+                f"Upstox returned HTTP {status}. Check token validity, "
+                "instrument key, API permissions, and Render logs."
             )
 
-        return {
-            "symbol": symbol,
-            "as_of": None,
-            "source": "Upstox API (error)",
-            "data": empty_data,
-            "message": message,
-            "fresh": False,
-        }
+        except httpx.HTTPError:
+            base["market_data_status"] = "CONNECTION_ERROR"
+            base["source"] = "Upstox API (connection error)"
+            base["message"] = (
+                "Upstox request failed or timed out. Check Render logs "
+                "and outbound connectivity."
+            )
+
+        except (ValueError, TypeError, KeyError, IndexError):
+            base["market_data_status"] = "INVALID_RESPONSE"
+            base["source"] = "Upstox API (invalid response)"
+            base["message"] = (
+                "Upstox response is missing required fields or has an "
+                "unexpected format. No trading signal generated."
+            )
+
+        return base
 
 
 provider = DataProvider()
@@ -179,7 +225,7 @@ def health():
     return {
         "ok": True,
         "app": app.title,
-        "time": datetime.now(timezone.utc).isoformat(),
+        "time": utc_now().isoformat(),
         "upstox_token_configured": bool(provider.token),
     }
 
@@ -193,11 +239,14 @@ async def snapshot(symbol: str):
             "symbol": symbol,
             "ready": False,
             "signal": "WAIT",
-            "message": "Unsupported symbol. Choose NIFTY or BANKNIFTY.",
-            "data": {key: None for key in REQUIRED},
-            "missing": REQUIRED,
-            "source": "None",
             "as_of": None,
+            "checked_at": utc_now().isoformat(),
+            "source": "None",
+            "market_data_status": "UNAVAILABLE",
+            "fresh": False,
+            "data": empty_data(),
+            "missing": REQUIRED,
+            "message": "Unsupported symbol. Choose NIFTY or BANKNIFTY.",
             "reasons": ["Unsupported symbol."],
         }
 
@@ -209,15 +258,25 @@ async def snapshot(symbol: str):
         if not isinstance(data.get(key), dict)
     ]
 
+    direction = data.get("index_direction")
+    index_valid = (
+        isinstance(direction, dict)
+        and direction.get("fresh") is True
+        and direction.get("bias") in (-1, 0, 1)
+    )
+
     ready = (
         not missing
         and snap.get("fresh") is True
+        and index_valid
         and bool(snap.get("as_of"))
     )
 
-    # This integration stage intentionally does not issue BUY signals.
-    # The other four data sources must be implemented and validated first.
+    # Safe integration stage:
+    # Do not generate BUY signals until all five checks are implemented,
+    # timestamp-validated, and evaluated by a tested decision engine.
     signal = "WAIT"
+
     reasons = []
 
     if missing:
@@ -226,11 +285,14 @@ async def snapshot(symbol: str):
         )
 
     if not snap.get("fresh"):
-        reasons.append("Index candle is missing or stale.")
+        reasons.append("Index candle is missing, stale, or future-dated.")
+
+    if not index_valid:
+        reasons.append("Index direction is not validated.")
 
     reasons.append(
-        "Signal generation remains disabled until all five data checks "
-        "are connected, validated, and fresh."
+        "BUY signals remain disabled until all five checks are "
+        "implemented, validated, and fresh."
     )
 
     return {
@@ -238,7 +300,10 @@ async def snapshot(symbol: str):
         "ready": ready,
         "signal": signal,
         "as_of": snap.get("as_of"),
+        "checked_at": snap.get("checked_at"),
         "source": snap.get("source"),
+        "market_data_status": snap.get("market_data_status"),
+        "fresh": snap.get("fresh", False),
         "data": data,
         "missing": missing,
         "message": snap.get("message"),
