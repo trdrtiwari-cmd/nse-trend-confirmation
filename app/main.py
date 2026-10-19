@@ -13,10 +13,13 @@ from fastapi.staticfiles import StaticFiles
 
 
 BASE = Path(__file__).resolve().parent.parent
+INDIA_TZ = ZoneInfo("Asia/Kolkata")
+
+MAX_CANDLE_AGE_SECONDS = 15 * 60
 
 app = FastAPI(
     title="NSE Trend Confirmation",
-    version="0.4.0",
+    version="0.5.0",
 )
 
 app.mount(
@@ -38,9 +41,6 @@ INSTRUMENTS = {
     "BANKNIFTY": "NSE_INDEX|Nifty Bank",
 }
 
-MAX_CANDLE_AGE_SECONDS = 15 * 60
-INDIA_TZ = ZoneInfo("Asia/Kolkata")
-
 
 def empty_data() -> dict[str, Any]:
     return {key: None for key in REQUIRED}
@@ -61,9 +61,56 @@ def parse_timestamp(value: Any) -> datetime:
     return timestamp.astimezone(timezone.utc)
 
 
+def market_session_finished(now: datetime | None = None) -> bool:
+    """
+    Conservative expiry default:
+    after 15:30 IST, do not default to today's expiry.
+    This is not a holiday-calendar or exchange-session validator.
+    """
+    current = now or datetime.now(INDIA_TZ)
+    return (
+        current.hour > 15
+        or (current.hour == 15 and current.minute >= 30)
+    )
+
+
+def available_expiries(
+    contracts: list[Any],
+    now: datetime | None = None,
+) -> list[str]:
+    current = now or datetime.now(INDIA_TZ)
+    today = current.date().isoformat()
+    after_market = market_session_finished(current)
+
+    values = set()
+
+    for item in contracts:
+        if not isinstance(item, dict):
+            continue
+
+        raw_expiry = item.get("expiry")
+        if not raw_expiry:
+            continue
+
+        expiry_text = str(raw_expiry)
+
+        # Expected API expiry format: YYYY-MM-DD.
+        try:
+            datetime.strptime(expiry_text, "%Y-%m-%d")
+        except ValueError:
+            continue
+
+        if expiry_text > today:
+            values.add(expiry_text)
+        elif expiry_text == today and not after_market:
+            values.add(expiry_text)
+
+    return sorted(values)
+
+
 class DataProvider:
     def __init__(self):
-        # Keep the token in Render Environment Variables only.
+        # Store the token only in Render Environment Variables.
         self.token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
 
     async def snapshot(self, symbol: str) -> dict[str, Any]:
@@ -107,8 +154,8 @@ class DataProvider:
 
             candles = payload.get("data", {}).get("candles", [])
 
-            if not isinstance(candles, list) or len(candles) < 2:
-                raise ValueError("Fewer than two candles returned")
+            if not isinstance(candles, list):
+                raise ValueError("Invalid candle response")
 
             parsed = []
 
@@ -125,7 +172,7 @@ class DataProvider:
                 parsed.append((candle_dt, candle, close))
 
             if len(parsed) < 2:
-                raise ValueError("Not enough valid candles")
+                raise ValueError("Fewer than two valid candles")
 
             parsed.sort(key=lambda item: item[0])
 
@@ -163,13 +210,13 @@ class DataProvider:
 
             if fresh:
                 base["message"] = (
-                    "Fresh index candle received. The other four "
-                    "required checks are not connected; signal remains WAIT."
+                    "Index candle received. Other four required checks "
+                    "are not connected; signal remains WAIT."
                 )
             else:
                 base["message"] = (
-                    "Latest candle is stale or future-dated. Price is shown "
-                    "for diagnosis only; signal remains WAIT."
+                    "Latest index candle is stale or future-dated. "
+                    "Price is for diagnosis only; signal remains WAIT."
                 )
 
             return base
@@ -194,8 +241,8 @@ class DataProvider:
             base["market_data_status"] = "INVALID_RESPONSE"
             base["source"] = "Upstox API (invalid response)"
             base["message"] = (
-                "Upstox response is missing required fields or has an "
-                "unexpected format. No trading signal generated."
+                "Upstox candle response is invalid. "
+                "No trading signal generated."
             )
 
         return base
@@ -262,8 +309,8 @@ async def snapshot(symbol: str):
         and bool(snap.get("as_of"))
     )
 
-    # Safe mode: do not enable BUY until all required checks
-    # and the decision engine have been implemented and tested.
+    # Deliberately WAIT-only until all checks and the decision engine
+    # are implemented, validated, and tested.
     signal = "WAIT"
     reasons = []
 
@@ -311,6 +358,25 @@ def option_details(
     market = option.get("market_data") or {}
     greeks = option.get("option_greeks") or {}
 
+    current_oi = market.get("oi")
+    previous_oi = market.get("prev_oi")
+
+    oi_change = None
+    oi_change_pct = None
+
+    try:
+        current_number = float(current_oi)
+        previous_number = float(previous_oi)
+
+        oi_change = current_number - previous_number
+
+        if previous_number != 0:
+            oi_change_pct = (
+                oi_change / abs(previous_number)
+            ) * 100
+    except (TypeError, ValueError):
+        pass
+
     return {
         "type": side,
         "strike": row.get("strike_price"),
@@ -318,8 +384,10 @@ def option_details(
         "ltp": market.get("ltp"),
         "close_price": market.get("close_price"),
         "volume": market.get("volume"),
-        "oi": market.get("oi"),
-        "prev_oi": market.get("prev_oi"),
+        "oi": current_oi,
+        "prev_oi": previous_oi,
+        "oi_change": oi_change,
+        "oi_change_pct": oi_change_pct,
         "iv": greeks.get("iv", market.get("iv")),
         "delta": greeks.get("delta"),
         "theta": greeks.get("theta"),
@@ -351,13 +419,23 @@ async def options_snapshot(
             "message": "Upstox token is not configured in Render.",
         }
 
+    if expiry_date:
+        try:
+            datetime.strptime(expiry_date, "%Y-%m-%d")
+        except ValueError:
+            return {
+                "ok": False,
+                "message": "expiry_date must use YYYY-MM-DD format.",
+            }
+
     instrument = INSTRUMENTS[symbol]
+
     headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {provider.token}",
     }
 
-    today = datetime.now(INDIA_TZ).date().isoformat()
+    now_ist = datetime.now(INDIA_TZ)
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -374,13 +452,9 @@ async def options_snapshot(
             if not isinstance(contracts, list):
                 raise ValueError("Invalid contracts response")
 
-            expiries = sorted({
-                str(item["expiry"])
-                for item in contracts
-                if isinstance(item, dict)
-                and item.get("expiry")
-                and str(item["expiry"]) >= today
-            })
+            # After 15:30 IST, exclude today's expiry from the default
+            # list. The exchange holiday calendar is not checked here.
+            expiries = available_expiries(contracts, now_ist)
 
             if expiry_date:
                 if expiry_date not in expiries:
@@ -388,11 +462,12 @@ async def options_snapshot(
                         "ok": False,
                         "symbol": symbol,
                         "message": (
-                            "Expiry not available. Use an expiry "
-                            "listed in available_expiries."
+                            "Expiry is not in the currently selectable "
+                            "expiry list. Refresh and choose an available expiry."
                         ),
                         "available_expiries": expiries,
                     }
+
                 selected_expiry = expiry_date
             else:
                 if not expiries:
@@ -400,9 +475,11 @@ async def options_snapshot(
                         "ok": False,
                         "symbol": symbol,
                         "message": (
-                            "No current or future expiry returned by Upstox."
+                            "No selectable current or future expiry "
+                            "was returned by Upstox."
                         ),
                     }
+
                 selected_expiry = expiries[0]
 
             chain_response = await client.get(
@@ -423,6 +500,7 @@ async def options_snapshot(
                 "ok": False,
                 "symbol": symbol,
                 "expiry": selected_expiry,
+                "available_expiries": expiries,
                 "message": "Option chain is empty.",
             }
 
@@ -448,9 +526,10 @@ async def options_snapshot(
                 "message": "No valid strike or spot price found.",
             }
 
+        # Use the most frequent underlying spot if the API has repeated rows.
         spot = valid_rows[0][1]
         strikes = sorted({item[0] for item in valid_rows})
-        atm_strike = min(strikes, key=lambda k: abs(k - spot))
+        atm_strike = min(strikes, key=lambda strike: abs(strike - spot))
 
         ce_candidates = []
         pe_candidates = []
@@ -462,14 +541,20 @@ async def options_snapshot(
                     pe_candidates.append((0, strike, row))
 
             elif moneyness == "ITM":
+                # Call ITM: strike below or equal to spot.
                 if strike <= spot:
                     ce_candidates.append((spot - strike, strike, row))
+
+                # Put ITM: strike above or equal to spot.
                 if strike >= spot:
                     pe_candidates.append((strike - spot, strike, row))
 
             else:  # OTM
+                # Call OTM: strike above or equal to spot.
                 if strike >= spot:
                     ce_candidates.append((strike - spot, strike, row))
+
+                # Put OTM: strike below or equal to spot.
                 if strike <= spot:
                     pe_candidates.append((spot - strike, strike, row))
 
@@ -493,11 +578,12 @@ async def options_snapshot(
             "pe": pe,
             "fetched_at": utc_now().isoformat(),
             "quote_timestamp_available": False,
+            "quote_freshness_verified": False,
             "source": "Upstox Option Chain API",
             "message": (
-                "Option-chain response received. fetched_at is the "
-                "server fetch time, not an exchange quote timestamp. "
-                "Verify quote freshness before trading."
+                "Option-chain response received. fetched_at is server "
+                "fetch time, not an exchange quote timestamp. Quote "
+                "freshness is not verified; do not treat this as a trade signal."
             ),
         }
 
@@ -507,8 +593,7 @@ async def options_snapshot(
             "symbol": symbol,
             "message": (
                 f"Upstox returned HTTP {exc.response.status_code}. "
-                "Check API access, token validity, permissions, "
-                "and Render logs."
+                "Check API access, token validity, permissions, and Render logs."
             ),
         }
 
