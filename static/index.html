@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="hi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>NSE Trend Confirmation</title><link rel="stylesheet" href="/static/style.css"></head>
+<body><main class="wrap">
+<header><div><div class="eyebrow">MARKET BREADTH · OPTIONS · PRICE ACTION</div><h1>NSE Trend Confirmation</h1><p class="sub">NIFTY 50 और BANK NIFTY के लिए पाँच-जाँच वाला निर्णय डैशबोर्ड</p></div><span class="pill">LIVE DATA: NOT CONFIGURED</span></header>
+<section class="toolbar"><label for="symbol">इंडेक्स चुनें</label><select id="symbol"><option value="NIFTY">NIFTY 50</option><option value="BANKNIFTY">BANK NIFTY</option></select><button id="refresh">डेटा जाँचें</button><span id="updated">अभी तक डेटा प्राप्त नहीं हुआ</span></section>
+<section class="signal-card"><div><span class="label">FINAL DECISION</span><h2 id="signal">WAIT</h2><p id="message">डेटा स्रोत कॉन्फ़िगर नहीं है। अनुमानित ट्रेड सिग्नल नहीं दिखाया जाएगा।</p></div><div class="signal-mark">Ⅱ</div></section>
+<section class="grid" id="checks">
+<article class="check"><span class="num">01</span><h3>Advance–Decline Ratio</h3><p>बढ़ते बनाम गिरते शेयर</p><strong>डेटा उपलब्ध नहीं</strong><small>आवश्यक: ratio और timestamp</small></article>
+<article class="check"><span class="num">02</span><h3>Sector Heat Map</h3><p>प्रमुख सेक्टरों की दिशा</p><strong>डेटा उपलब्ध नहीं</strong><small>आवश्यक: sector bias</small></article>
+<article class="check"><span class="num">03</span><h3>Option Premium % Change</h3><p>तुलनीय CE और PE प्रीमियम</p><strong>डेटा उपलब्ध नहीं</strong><small>आवश्यक: CE/PE प्रतिशत बदलाव</small></article>
+<article class="check"><span class="num">04</span><h3>CE/PE Premium Graph</h3><p>कॉल और पुट का तुलनात्मक मूवमेंट</p><strong>डेटा उपलब्ध नहीं</strong><small>आवश्यक: समान interval का trend</small></article>
+<article class="check"><span class="num">05</span><h3>Index Price Direction</h3><p>Higher High/Low या Lower High/Low</p><strong>डेटा उपलब्ध नहीं</strong><small>आवश्यक: candles और timestamp</small></article>
+<article class="check note"><span class="num">RULE</span><h3>Signal discipline</h3><p>सभी पाँच जाँचें एक दिशा में हों तभी संभावित BUY CE या BUY PE; अन्यथा WAIT।</p><strong>डेटा गायब = WAIT</strong><small>यह संकेत लाभ की गारंटी नहीं है।</small></article>
+</section>
+<section class="bottom"><h3>डेटा स्रोत की स्थिति</h3><p id="sourceStatus">अभी कोई अधिकृत लाइव डेटा प्रदाता कनेक्ट नहीं है।</p><p class="fine">यह starter dashboard है। NSE वेबसाइट को scrape नहीं करता। वास्तविक ऑटोमैटिक विकल्प डेटा के लिए अनुमति-प्राप्त डेटा प्रदाता/API या आपके ब्रोकर का अधिकृत API जोड़ना होगा। जब तक सभी आवश्यक और ताज़ा डेटा उपलब्ध न हों, सिस्टम BUY सिग्नल नहीं देगा।</p></section>
+<footer>For research and decision support only · No order placement · Verify data freshness before trading</footer>
+</main><script src="/static/app.js"></script></body></html>
