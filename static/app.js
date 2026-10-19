@@ -1,4 +1,12 @@
 
+const $ = (id) => document.getElementById(id);
+
+const symbol = $('symbol');
+const expiry = $('expiry');
+const moneyness = $('moneyness');
+const refreshButton = $('refresh');
+const loadOptionsButton = $('loadOptions');
+
 const labels = {
   advance_decline: 'Advance–Decline Ratio',
   sector_heatmap: 'Sector Heat Map',
@@ -7,26 +15,15 @@ const labels = {
   index_direction: 'Index Price Direction'
 };
 
-const symbol = document.getElementById('symbol');
-const signal = document.getElementById('signal');
-const message = document.getElementById('message');
-const updated = document.getElementById('updated');
-const sourceStatus = document.getElementById('sourceStatus');
-const cards = [...document.querySelectorAll('.check:not(.note)')];
-const livePill = document.querySelector('header .pill');
-const refreshButton = document.getElementById('refresh');
-
-const directions = {
+const directionNames = {
   1: 'Bullish',
   0: 'Neutral',
   '-1': 'Bearish'
 };
 
 function formatTime(value) {
-  if (!value) return 'समय उपलब्ध नहीं';
-
+  if (!value) return '—';
   const date = new Date(value);
-
   if (Number.isNaN(date.getTime())) return String(value);
 
   return date.toLocaleString('en-IN', {
@@ -36,17 +33,60 @@ function formatTime(value) {
   }) + ' IST';
 }
 
-function describe(key, value) {
-  if (value === null || value === undefined) {
-    return 'डेटा उपलब्ध नहीं';
+function number(value, digits = 2) {
+  if (value === null || value === undefined || value === '') return '—';
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return '—';
+
+  return parsed.toLocaleString('en-IN', {
+    maximumFractionDigits: digits
+  });
+}
+
+function money(value) {
+  const valueText = number(value, 2);
+  return valueText === '—' ? valueText : '₹' + valueText;
+}
+
+function percentChange(current, previous) {
+  const now = Number(current);
+  const before = Number(previous);
+
+  if (
+    current === null || current === undefined ||
+    previous === null || previous === undefined ||
+    !Number.isFinite(now) || !Number.isFinite(before) ||
+    before === 0
+  ) {
+    return '—';
   }
+
+  const difference = now - before;
+  const percent = difference / Math.abs(before) * 100;
+
+  return `${number(difference, 0)} (${number(percent, 2)}%)`;
+}
+
+function setSignalWait(text) {
+  $('signal').textContent = 'WAIT';
+  $('signal').style.color = '#ffd58a';
+  if (text) $('message').textContent = text;
+}
+
+function setPill(element, text, state = '') {
+  element.textContent = text;
+  element.className = 'pill' + (state ? ' ' + state : '');
+}
+
+function describe(key, value) {
+  if (!value) return 'डेटा उपलब्ध नहीं';
 
   if (key === 'advance_decline') {
     return 'A/D: ' + (value.ratio ?? '—');
   }
 
   if (key === 'sector_heatmap') {
-    return 'Bias: ' + (directions[value.bias] ?? '—');
+    return 'Bias: ' + (directionNames[value.bias] ?? '—');
   }
 
   if (key === 'option_premium_change') {
@@ -54,183 +94,264 @@ function describe(key, value) {
   }
 
   if (key === 'call_put_graph') {
-    return 'Bias: ' + (directions[value.bias] ?? '—');
+    return 'Bias: ' + (directionNames[value.bias] ?? '—');
   }
 
   if (key === 'index_direction') {
-    const price = Number.isFinite(Number(value.price))
-      ? Number(value.price).toLocaleString('en-IN', {
-          maximumFractionDigits: 2
-        })
-      : '—';
+    const price = money(value.price);
 
-    if (
-      value.fresh !== true ||
-      value.bias === null ||
-      value.bias === undefined
-    ) {
-      return `STALE / UNVERIFIED · Price: ${price}`;
+    if (value.fresh !== true || value.bias === null || value.bias === undefined) {
+      return `STALE / UNVERIFIED · ${price}`;
     }
 
-    return `${directions[value.bias] ?? '—'} · Price: ${price}`;
+    return `${directionNames[value.bias] ?? '—'} · ${price}`;
   }
 
   return 'डेटा उपलब्ध';
 }
 
-function setSignalWait(text) {
-  signal.textContent = 'WAIT';
-  signal.style.color = '#ffd58a';
+function updateCheckCards(data) {
+  const cards = [...document.querySelectorAll('#checks .check:not(.note)')];
 
-  if (text) message.textContent = text;
-}
+  cards.forEach((card) => {
+    const heading = card.querySelector('h3')?.textContent;
+    const key = Object.keys(labels).find((item) => labels[item] === heading);
+    if (!key) return;
 
-function updateCard(card, key, value) {
-  const strong = card.querySelector('strong');
-  const small = card.querySelector('small');
+    const value = data?.[key];
+    const strong = card.querySelector('strong');
+    const small = card.querySelector('small');
 
-  if (!strong || !small) return;
+    strong.textContent = describe(key, value);
 
-  strong.textContent = describe(key, value);
-
-  if (key === 'index_direction' && value) {
-    small.textContent =
-      'Candle: ' + formatTime(value.candle_time) +
-      ' · ' + (
-        value.fresh === true &&
-        value.bias !== null &&
-        value.bias !== undefined
-          ? 'Fresh direction'
-          : 'पुरानी/अमान्य candle; signal में उपयोग नहीं'
-      );
-
-    return;
-  }
-
-  small.textContent = value
-    ? 'Data received; freshness and source validation required'
-    : 'डेटा अनुपलब्ध — इस check से signal नहीं बनेगा';
-}
-
-function updateStatus(result) {
-  const direction = result.data?.index_direction;
-  const status = result.market_data_status || 'UNAVAILABLE';
-
-  if (livePill) {
-    if (status === 'STALE') {
-      livePill.textContent = 'INDEX DATA: STALE';
-    } else if (status === 'API_ERROR') {
-      livePill.textContent = 'UPSTOX API: ERROR';
-    } else if (status === 'CONNECTION_ERROR') {
-      livePill.textContent = 'API: CONNECTION ERROR';
-    } else if (status === 'INVALID_RESPONSE') {
-      livePill.textContent = 'API: INVALID RESPONSE';
-    } else if (
-      direction &&
-      direction.fresh === true &&
-      direction.bias !== null &&
-      direction.bias !== undefined
-    ) {
-      livePill.textContent = 'INDEX DATA: RECEIVED';
+    if (key === 'index_direction' && value) {
+      small.textContent =
+        'Candle: ' + formatTime(value.candle_time) +
+        ' · ' + (value.fresh === true ? 'Fresh candle' : 'Stale/unverified');
     } else {
-      livePill.textContent = 'INDEX DATA: UNAVAILABLE';
+      small.textContent = value
+        ? 'Data received; validation still required'
+        : 'डेटा अनुपलब्ध — signal में उपयोग नहीं';
     }
-  }
+  });
 
-  sourceStatus.textContent =
-    'Source: ' + (result.source || 'Unknown') +
-    ' · Status: ' + status +
-    ' · ' + (
-      result.ready
-        ? 'All required checks validated'
-        : 'Required data incomplete or not fresh'
-    );
+  const direction = data?.index_direction;
+
+  $('indexValue').textContent = describe('index_direction', direction);
+  $('indexDetails').textContent = direction
+    ? `Candle: ${formatTime(direction.candle_time)}`
+    : 'Candle timestamp उपलब्ध नहीं है।';
 }
 
-async function refresh() {
-  setSignalWait('डेटा स्रोत की जाँच हो रही है…');
-  updated.textContent = 'जाँच जारी…';
+async function refreshSnapshot() {
+  setSignalWait('Index data और required checks की जाँच हो रही है।');
+  $('updated').textContent = 'जाँच जारी…';
+  setPill($('livePill'), 'DATA STATUS: CHECKING');
 
-  if (livePill) livePill.textContent = 'DATA STATUS: CHECKING';
-  if (refreshButton) refreshButton.disabled = true;
+  refreshButton.disabled = true;
 
   try {
     const response = await fetch(
-      '/api/snapshot/' + encodeURIComponent(symbol.value),
+      `/api/snapshot/${encodeURIComponent(symbol.value)}`,
       { cache: 'no-store' }
     );
 
-    if (!response.ok) {
-      throw new Error('HTTP ' + response.status);
-    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
     const result = await response.json();
 
-    // The backend's signal is displayed only when all checks are ready.
-    // This integration version intentionally keeps WAIT as the fallback.
-    const safeSignal =
-      result.ready === true &&
-      ['BUY CE', 'BUY PE', 'WAIT'].includes(result.signal)
-        ? result.signal
-        : 'WAIT';
-
-    signal.textContent = safeSignal;
-
-    if (safeSignal === 'BUY CE') {
-      signal.style.color = '#61e3b6';
-    } else if (safeSignal === 'BUY PE') {
-      signal.style.color = '#ff7d8a';
-    } else {
-      signal.style.color = '#ffd58a';
-    }
-
-    message.textContent =
+    // This backend version deliberately remains WAIT-only.
+    setSignalWait(
       result.message ||
       (result.reasons || []).join(' ') ||
-      'सभी आवश्यक डेटा की पुष्टि करें।';
-
-    updated.textContent = result.as_of
-      ? 'Candle time: ' + formatTime(result.as_of) +
-        (result.checked_at
-          ? ' · Checked: ' + formatTime(result.checked_at)
-          : '')
-      : 'ताज़ा candle timestamp उपलब्ध नहीं';
-
-    updateStatus(result);
-
-    cards.forEach(card => {
-      const heading = card.querySelector('h3')?.textContent;
-      const key = Object.keys(labels).find(
-        item => labels[item] === heading
-      );
-
-      if (!key) return;
-
-      updateCard(card, key, result.data?.[key]);
-    });
-
-  } catch (error) {
-    setSignalWait(
-      'सर्वर से डेटा नहीं मिला। अनुमानित trading signal रोक दिया गया है।'
+      'Required checks अभी पूर्ण नहीं हैं।'
     );
 
-    updated.textContent = 'कनेक्शन त्रुटि';
-    sourceStatus.textContent = 'API अनुपलब्ध';
+    $('updated').textContent = result.as_of
+      ? `Candle: ${formatTime(result.as_of)} · Checked: ${formatTime(result.checked_at)}`
+      : 'Candle timestamp उपलब्ध नहीं';
 
-    if (livePill) livePill.textContent = 'DATA STATUS: ERROR';
+    updateCheckCards(result.data);
 
+    const status = result.market_data_status || 'UNAVAILABLE';
+
+    if (status === 'RECEIVED' && result.fresh) {
+      setPill($('livePill'), 'INDEX: FRESH', 'good');
+    } else if (status === 'STALE') {
+      setPill($('livePill'), 'INDEX: STALE', 'warn');
+    } else if (status === 'API_ERROR' || status === 'CONNECTION_ERROR') {
+      setPill($('livePill'), 'INDEX API: ERROR', 'bad');
+    } else {
+      setPill($('livePill'), 'INDEX: UNAVAILABLE', 'warn');
+    }
+
+    $('sourceStatus').textContent =
+      `Source: ${result.source || 'Unknown'} · Status: ${status} · ` +
+      (result.ready ? 'Checks validated' : 'Required checks incomplete');
+
+  } catch (error) {
+    setSignalWait('Snapshot API से डेटा नहीं मिला। कोई अनुमानित signal नहीं दिखाया जाएगा।');
+    $('updated').textContent = 'Connection error';
+    $('sourceStatus').textContent = 'Snapshot API unavailable.';
+    setPill($('livePill'), 'DATA STATUS: ERROR', 'bad');
     console.error('Snapshot request failed:', error);
   } finally {
-    if (refreshButton) refreshButton.disabled = false;
+    refreshButton.disabled = false;
   }
 }
 
-if (refreshButton) {
-  refreshButton.addEventListener('click', refresh);
+function renderOptionRows(data) {
+  const ce = data?.ce || {};
+  const pe = data?.pe || {};
+
+  const rows = [
+    ['Strike', number(ce.strike, 0), number(pe.strike, 0)],
+    ['Instrument Key', ce.instrument_key || '—', pe.instrument_key || '—'],
+    ['LTP', money(ce.ltp), money(pe.ltp)],
+    ['Previous Close', money(ce.close_price), money(pe.close_price)],
+    ['Volume', number(ce.volume, 0), number(pe.volume, 0)],
+    ['Open Interest (OI)', number(ce.oi, 0), number(pe.oi, 0)],
+    ['OI Change', percentChange(ce.oi, ce.prev_oi), percentChange(pe.oi, pe.prev_oi)],
+    ['Previous OI', number(ce.prev_oi, 0), number(pe.prev_oi, 0)],
+    ['IV', number(ce.iv, 2), number(pe.iv, 2)],
+    ['Delta', number(ce.delta, 4), number(pe.delta, 4)],
+    ['Theta', number(ce.theta, 4), number(pe.theta, 4)],
+    ['Gamma', number(ce.gamma, 5), number(pe.gamma, 5)],
+    ['Vega', number(ce.vega, 4), number(pe.vega, 4)]
+  ];
+
+  $('optionRows').replaceChildren();
+
+  rows.forEach(([label, callValue, putValue]) => {
+    const tr = document.createElement('tr');
+
+    [label, callValue, putValue].forEach((value, index) => {
+      const td = document.createElement('td');
+      td.textContent = value;
+      if (index === 1) td.className = 'ce-col';
+      if (index === 2) td.className = 'pe-col';
+      tr.appendChild(td);
+    });
+
+    $('optionRows').appendChild(tr);
+  });
 }
 
-if (symbol) {
-  symbol.addEventListener('change', refresh);
+function renderOptionError(message) {
+  $('optionRows').replaceChildren();
+
+  const tr = document.createElement('tr');
+  const td = document.createElement('td');
+  td.colSpan = 3;
+  td.textContent = message || 'Option data उपलब्ध नहीं है।';
+  tr.appendChild(td);
+  $('optionRows').appendChild(tr);
 }
 
-refresh();
+async function loadOptions() {
+  loadOptionsButton.disabled = true;
+  setPill($('optionStatus'), 'OPTIONS: LOADING');
+  $('optionMessage').textContent = 'Option-chain data प्राप्त हो रहा है…';
+
+  try {
+    const params = new URLSearchParams({
+      moneyness: moneyness.value
+    });
+
+    if (expiry.value) params.set('expiry_date', expiry.value);
+
+    const response = await fetch(
+      `/api/options/${encodeURIComponent(symbol.value)}?${params.toString()}`,
+      { cache: 'no-store' }
+    );
+
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    const result = await response.json();
+
+    if (!result.ok) {
+      renderOptionError(result.message || 'Option API ने data नहीं दिया।');
+      $('optionMessage').textContent = result.message || 'Option data unavailable.';
+      $('spotValue').textContent = '—';
+      $('atmValue').textContent = '—';
+      $('selectedExpiry').textContent = result.expiry || '—';
+      $('fetchTime').textContent = '—';
+      setPill($('optionStatus'), 'OPTIONS: ERROR', 'bad');
+
+      if (Array.isArray(result.available_expiries)) {
+        populateExpiries(result.available_expiries, expiry.value);
+      }
+      return;
+    }
+
+    if (Array.isArray(result.available_expiries)) {
+      populateExpiries(result.available_expiries, result.expiry);
+    }
+
+    $('spotValue').textContent = number(result.spot, 2);
+    $('atmValue').textContent = number(result.atm_strike, 0);
+    $('selectedExpiry').textContent = result.expiry || '—';
+    $('fetchTime').textContent = formatTime(result.fetched_at);
+
+    renderOptionRows(result);
+
+    $('optionMessage').textContent =
+      `${result.symbol} · ${result.moneyness} · Expiry ${result.expiry}. ` +
+      'Server fetch time quote timestamp नहीं है; freshness independently verified नहीं है।';
+
+    setPill($('optionStatus'), 'OPTIONS: RECEIVED', 'good');
+
+  } catch (error) {
+    renderOptionError('Option API से संपर्क नहीं हो सका। Render logs और API status जाँचें।');
+    $('optionMessage').textContent = 'Request failed: ' + error.message;
+    setPill($('optionStatus'), 'OPTIONS: ERROR', 'bad');
+    console.error('Option request failed:', error);
+  } finally {
+    loadOptionsButton.disabled = false;
+  }
+}
+
+function populateExpiries(expiries, preferredValue = '') {
+  const previous = preferredValue || expiry.value;
+
+  expiry.replaceChildren();
+
+  if (!Array.isArray(expiries) || expiries.length === 0) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'Expiry उपलब्ध नहीं';
+    expiry.appendChild(option);
+    return;
+  }
+
+  expiries.forEach((date) => {
+    const option = document.createElement('option');
+    option.value = date;
+    option.textContent = date;
+    expiry.appendChild(option);
+  });
+
+  if (expiries.includes(previous)) {
+    expiry.value = previous;
+  } else {
+    expiry.value = expiries[0];
+  }
+}
+
+refreshButton.addEventListener('click', refreshSnapshot);
+loadOptionsButton.addEventListener('click', loadOptions);
+
+symbol.addEventListener('change', async () => {
+  await refreshSnapshot();
+  await loadOptions();
+});
+
+expiry.addEventListener('change', loadOptions);
+moneyness.addEventListener('change', loadOptions);
+
+async function initializeDashboard() {
+  await refreshSnapshot();
+  await loadOptions();
+}
+
+initializeDashboard();
