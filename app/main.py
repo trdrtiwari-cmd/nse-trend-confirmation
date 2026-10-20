@@ -1,95 +1,65 @@
+"""FastAPI entry point. Routes are thin wrappers over app.service."""
+from __future__ import annotations
 
-from datetime import datetime, timezone
+import logging
 from pathlib import Path
-from typing import Any
-from urllib.parse import quote
-from zoneinfo import ZoneInfo
-import os
 
-import httpx
-from fastapi import FastAPI, Query
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from . import logic
+from .service import build_options, build_snapshot
+from .universe import SYMBOLS
+from .upstox import UpstoxClient, get_token
 
 BASE = Path(__file__).resolve().parent.parent
-INDIA_TZ = ZoneInfo("Asia/Kolkata")
+logging.basicConfig(level=logging.INFO)
 
-MAX_CANDLE_AGE_SECONDS = 15 * 60
+app = FastAPI(title="NSE Trend Confirmation", version="1.0.0")
+client = UpstoxClient()
 
-app = FastAPI(
-    title="NSE Trend Confirmation",
-    version="0.5.0",
-)
+app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
 
-app.mount(
-    "/static",
-    StaticFiles(directory=BASE / "static"),
-    name="static",
-)
-
-REQUIRED = [
-    "advance_decline",
-    "sector_heatmap",
-    "option_premium_change",
-    "call_put_graph",
-    "index_direction",
-]
-
-INSTRUMENTS = {
-    "NIFTY": "NSE_INDEX|Nifty 50",
-    "BANKNIFTY": "NSE_INDEX|Nifty Bank",
-}
+NO_CACHE = {"Cache-Control": "no-store"}
 
 
-def empty_data() -> dict[str, Any]:
-    return {key: None for key in REQUIRED}
+def _symbol(value: str) -> str:
+    symbol = value.upper()
+    if symbol not in SYMBOLS:
+        raise HTTPException(status_code=404, detail="Symbol NIFTY या BANKNIFTY होना चाहिए।")
+    return symbol
 
 
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+@app.get("/", include_in_schema=False)
+async def index() -> FileResponse:
+    return FileResponse(BASE / "static" / "index.html", headers=NO_CACHE)
 
 
-def parse_timestamp(value: Any) -> datetime:
-    timestamp = datetime.fromisoformat(
-        str(value).replace("Z", "+00:00")
-    )
-
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
-
-    return timestamp.astimezone(timezone.utc)
-
-
-def market_session_finished(now: datetime | None = None) -> bool:
-    """
-    Conservative expiry default:
-    after 15:30 IST, do not default to today's expiry.
-    This is not a holiday-calendar or exchange-session validator.
-    """
-    current = now or datetime.now(INDIA_TZ)
-    return (
-        current.hour > 15
-        or (current.hour == 15 and current.minute >= 30)
+@app.get("/api/health")
+async def health() -> JSONResponse:
+    return JSONResponse(
+        {
+            "status": "ok",
+            "token_configured": bool(get_token()),
+            "time_ist": logic.now_ist().isoformat(),
+            "market_open": logic.regular_market_hours(),
+        },
+        headers=NO_CACHE,
     )
 
 
-def regular_market_hours(now: datetime | None = None) -> bool:
-    """
-    Approximate NSE regular session: weekdays, 09:15–15:30 IST.
-    This does NOT check exchange holidays or special sessions.
-    """
-    current = (now or datetime.now(INDIA_TZ)).astimezone(INDIA_TZ)
-    minute_of_day = current.hour * 60 + current.minute
-    return current.weekday() < 5 and 9 * 60 + 15 <= minute_of_day < 15 * 60 + 30
+@app.get("/api/snapshot/{symbol}")
+async def snapshot(symbol: str) -> JSONResponse:
+    result = await build_snapshot(client, _symbol(symbol))
+    return JSONResponse(result, headers=NO_CACHE)
 
 
-def available_expiries(
-    contracts: list[Any],
-    now: datetime | None = None,
-) -> list[str]:
-    current = now or datetime.now(INDIA_TZ)
-    today = current.date().isoformat()
-    after_market = market_session_finished(current)
-
-    values = set()
+@app.get("/api/options/{symbol}")
+async def options(
+    symbol: str,
+    moneyness: str = Query("ATM"),
+    expiry_date: str | None = Query(None),
+) -> JSONResponse:
+    result = await build_options(client, _symbol(symbol), moneyness, expiry_date)
+    return JSONResponse(result, headers=NO_CACHE)
