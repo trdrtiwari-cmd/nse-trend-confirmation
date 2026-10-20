@@ -67,10 +67,27 @@ function percentChange(current, previous) {
   return `${number(difference, 0)} (${number(percent, 2)}%)`;
 }
 
-function setSignalWait(text) {
-  $('signal').textContent = 'WAIT';
-  $('signal').style.color = '#ffd58a';
+const SIGNAL_STYLE = {
+  'BUY CE': { color: '#5fe0a8', mark: '▲' },
+  'BUY PE': { color: '#ff7b7b', mark: '▼' },
+  WAIT: { color: '#ffd58a', mark: 'Ⅱ' }
+};
+
+function setSignal(signal, text) {
+  const value = SIGNAL_STYLE[signal] ? signal : 'WAIT';
+  const style = SIGNAL_STYLE[value];
+  $('signal').textContent = value;
+  $('signal').style.color = style.color;
+  const mark = document.querySelector('.signal-mark');
+  if (mark) {
+    mark.textContent = style.mark;
+    mark.style.color = style.color;
+  }
   if (text) $('message').textContent = text;
+}
+
+function setSignalWait(text) {
+  setSignal('WAIT', text);
 }
 
 function setPill(element, text, state = '') {
@@ -78,36 +95,71 @@ function setPill(element, text, state = '') {
   element.className = 'pill' + (state ? ' ' + state : '');
 }
 
+function biasText(bias) {
+  return bias === null || bias === undefined ? '—' : (directionNames[bias] ?? '—');
+}
+
+function signed(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  return (n > 0 ? '+' : '') + n.toFixed(2) + '%';
+}
+
 function describe(key, value) {
   if (!value) return 'डेटा उपलब्ध नहीं';
 
   if (key === 'advance_decline') {
-    return 'A/D: ' + (value.ratio ?? '—');
+    return `${biasText(value.bias)} · A/D ${value.ratio ?? '—'}`;
   }
 
   if (key === 'sector_heatmap') {
-    return 'Bias: ' + (directionNames[value.bias] ?? '—');
+    return `${biasText(value.bias)} · ${value.up ?? 0}↑ / ${value.down ?? 0}↓`;
   }
 
   if (key === 'option_premium_change') {
-    return `CE ${value.ce_pct ?? '—'}% · PE ${value.pe_pct ?? '—'}%`;
+    return `${biasText(value.bias)} · CE ${signed(value.ce_pct)} · PE ${signed(value.pe_pct)}`;
   }
 
   if (key === 'call_put_graph') {
-    return 'Bias: ' + (directionNames[value.bias] ?? '—');
+    return `${biasText(value.bias)} · CE ${signed(value.ce_session_pct)} · PE ${signed(value.pe_session_pct)}`;
   }
 
   if (key === 'index_direction') {
     const price = money(value.price);
-
-    if (value.fresh !== true || value.bias === null || value.bias === undefined) {
-      return `STALE / UNVERIFIED · ${price}`;
-    }
-
-    return `${directionNames[value.bias] ?? '—'} · ${price}`;
+    const change = value.change_pct === null || value.change_pct === undefined ? '' : ` · ${signed(value.change_pct)}`;
+    return `${biasText(value.bias)} · ${price}${change}`;
   }
 
   return 'डेटा उपलब्ध';
+}
+
+function details(key, value) {
+  if (!value) return 'डेटा अनुपलब्ध — signal में उपयोग नहीं';
+
+  if (key === 'advance_decline') {
+    return `Advances ${value.advances} · Declines ${value.declines} · Unchanged ${value.unchanged} (${value.counted}/${value.expected} stocks)`;
+  }
+
+  if (key === 'sector_heatmap') {
+    const list = (value.sectors || []).map((s) => `${s.name} ${signed(s.pct)}`);
+    return `Average ${signed(value.average_pct)} · ` + list.join(', ');
+  }
+
+  if (key === 'option_premium_change' || key === 'call_put_graph') {
+    const extra = [value.expiry ? `Expiry ${value.expiry}` : '', value.strike ? `Strike ${number(value.strike, 0)}` : '']
+      .filter(Boolean).join(' · ');
+    if (key === 'call_put_graph') {
+      return `Recent: CE ${signed(value.ce_recent_pct)} · PE ${signed(value.pe_recent_pct)}` + (extra ? ` · ${extra}` : '');
+    }
+    return 'Previous close के मुकाबले' + (extra ? ` · ${extra}` : '');
+  }
+
+  if (key === 'index_direction') {
+    const state = value.fresh === true ? 'Fresh candle' : (value.status === 'MARKET_CLOSED' ? 'Market closed — last session' : 'Stale/unverified');
+    return `Candle: ${formatTime(value.candle_time)} · ${state}`;
+  }
+
+  return '';
 }
 
 function updateCheckCards(data) {
@@ -123,24 +175,12 @@ function updateCheckCards(data) {
     const small = card.querySelector('small');
 
     strong.textContent = describe(key, value);
-
-    if (key === 'index_direction' && value) {
-      small.textContent =
-        'Candle: ' + formatTime(value.candle_time) +
-        ' · ' + (value.fresh === true ? 'Fresh candle' : 'Stale/unverified');
-    } else {
-      small.textContent = value
-        ? 'Data received; validation still required'
-        : 'डेटा अनुपलब्ध — signal में उपयोग नहीं';
-    }
+    strong.style.color = !value ? '#ffd58a'
+      : value.bias === 1 ? '#5fe0a8'
+      : value.bias === -1 ? '#ff7b7b'
+      : '#ffd58a';
+    small.textContent = details(key, value);
   });
-
-  const direction = data?.index_direction;
-
-  $('indexValue').textContent = describe('index_direction', direction);
-  $('indexDetails').textContent = direction
-    ? `Candle: ${formatTime(direction.candle_time)}`
-    : 'Candle timestamp उपलब्ध नहीं है।';
 }
 
 async function refreshSnapshot() {
@@ -160,8 +200,8 @@ async function refreshSnapshot() {
 
     const result = await response.json();
 
-    // This backend version deliberately remains WAIT-only.
-    setSignalWait(
+    setSignal(
+      result.signal,
       result.message ||
       (result.reasons || []).join(' ') ||
       'Required checks अभी पूर्ण नहीं हैं।'
@@ -169,7 +209,7 @@ async function refreshSnapshot() {
 
     $('updated').textContent = result.as_of
       ? `Candle: ${formatTime(result.as_of)} · Checked: ${formatTime(result.checked_at)}`
-      : 'Candle timestamp उपलब्ध नहीं';
+      : `Checked: ${formatTime(result.checked_at)}`;
 
     updateCheckCards(result.data);
 
@@ -177,17 +217,23 @@ async function refreshSnapshot() {
 
     if (status === 'RECEIVED' && result.fresh) {
       setPill($('livePill'), 'INDEX: FRESH', 'good');
+    } else if (status === 'MARKET_CLOSED') {
+      setPill($('livePill'), 'MARKET CLOSED', 'warn');
     } else if (status === 'STALE') {
       setPill($('livePill'), 'INDEX: STALE', 'warn');
+    } else if (status === 'NOT_CONFIGURED') {
+      setPill($('livePill'), 'TOKEN NOT SET', 'bad');
     } else if (status === 'API_ERROR' || status === 'CONNECTION_ERROR') {
       setPill($('livePill'), 'INDEX API: ERROR', 'bad');
     } else {
       setPill($('livePill'), 'INDEX: UNAVAILABLE', 'warn');
     }
 
+    const notes = (result.reasons || []).filter((r) => r && r !== result.message);
     $('sourceStatus').textContent =
       `Source: ${result.source || 'Unknown'} · Status: ${status} · ` +
-      (result.ready ? 'Checks validated' : 'Required checks incomplete');
+      (result.ready ? 'All checks available' : 'Required checks incomplete') +
+      (notes.length ? ' — ' + notes.join(' | ') : '');
 
   } catch (error) {
     setSignalWait('Snapshot API से डेटा नहीं मिला। कोई अनुमानित signal नहीं दिखाया जाएगा।');
